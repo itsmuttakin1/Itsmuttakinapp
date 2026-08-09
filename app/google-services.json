@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "223050595191",
+    "project_id": "appupdate-f9fdc",
+    "storage_bucket": "appupdate-f9fdc.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:223050595191:android:7e2ed14aac4ef8deef7f72",
+        "android_client_info": {
+          "package_name": "com.itsmuttakin.web"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBve3Xs5rYGqojIdsOAvK9lgVtfqF2td4U"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

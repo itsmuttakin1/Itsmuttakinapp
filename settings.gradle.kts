@@ -22,5 +22,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Its Muttakin"
+rootProject.name = "M BOX"
 include(":app")

@@ -133,7 +133,7 @@ class MainActivity : ComponentActivity() {
         }
         remoteConfig.setConfigSettingsAsync(configSettings)
         remoteConfig.setDefaultsAsync(mapOf(
-            "notice_text" to "Welcome to ITS MUTTAKIN!",
+            "notice_text" to "Welcome to M BOX!",
             "latest_version_code" to 1L,
             "update_url" to "https://itsmuttakin.pages.dev/",
             "update_required" to false
@@ -299,7 +299,7 @@ fun AppNavigation(currentLang: String, refreshTrigger: Int, onLangChange: (Strin
                 onStartDownload = {
                     val request = DownloadManager.Request(Uri.parse(updateUrl)).apply {
                         setMimeType("application/vnd.android.package-archive")
-                        setTitle("Updating Its Muttakin Studio")
+                        setTitle("Updating M BOX Studio")
                         setDescription("Downloading new version...")
                         setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
                         setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "update.apk")
@@ -574,7 +574,7 @@ fun AnimatedStudioText() {
     )
 
     Text(
-        text = "ITS MUTTAKIN",
+        text = "M BOX",
         color = Color.White,
         fontSize = 28.sp,
         fontWeight = FontWeight.ExtraBold,

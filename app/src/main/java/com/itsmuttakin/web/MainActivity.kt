@@ -89,6 +89,13 @@ import androidx.core.content.FileProvider
 import java.io.File
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.media3.common.MediaItem
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
+import java.net.URLDecoder
+import androidx.media3.common.MimeTypes
+import android.webkit.JavascriptInterface
+import android.webkit.MimeTypeMap
 
 data class AppStrings(
     val selectMode: String,
@@ -285,8 +292,16 @@ fun AppNavigation(currentLang: String, refreshTrigger: Int, onLangChange: (Strin
                         activeDownloads.add(DownloadInfo(id, name, 0f))
                         Toast.makeText(context, strings.downloadStarted, Toast.LENGTH_SHORT).show()
                     },
-                    onShowDownloads = { showDownloadSheet = true }
+                    onShowDownloads = { showDownloadSheet = true },
+                    onPlayVideo = { videoUrl ->
+                        val encodedUrl = Uri.encode(videoUrl)
+                        navController.navigate("player/$encodedUrl")
+                    }
                 )
+            }
+            composable("player/{url}") { backStackEntry ->
+                val videoUrl = backStackEntry.arguments?.getString("url")?.let { URLDecoder.decode(it, "UTF-8") } ?: ""
+                VideoPlayerScreen(url = videoUrl, onBack = { navController.popBackStack() })
             }
         }
         
@@ -639,7 +654,8 @@ fun WebViewScreen(
     onSwitch: () -> Unit, 
     onBackToHome: () -> Unit,
     onDownloadStart: (Long, String) -> Unit,
-    onShowDownloads: () -> Unit
+    onShowDownloads: () -> Unit,
+    onPlayVideo: (String) -> Unit
 ) {
     val context = LocalContext.current
     val strings = LocalStrings.current
@@ -744,12 +760,31 @@ fun WebViewScreen(
                         settings.allowFileAccess = true
                         settings.allowContentAccess = true
                         
+                        // Add JavaScript Interface
+                        addJavascriptInterface(object {
+                            @JavascriptInterface
+                            fun playVideo(videoUrl: String) {
+                                (context as? Activity)?.runOnUiThread {
+                                    onPlayVideo(videoUrl)
+                                }
+                            }
+                        }, "Android")
+
                         // User Agent for TV
                         if (mode == "tv") {
                             settings.userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
                         }
 
                         webViewClient = object : WebViewClient() {
+                            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                                val url = request?.url?.toString() ?: ""
+                                if (isVideoUrl(url)) {
+                                    onPlayVideo(url)
+                                    return true
+                                }
+                                return false
+                            }
+
                             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                                 isLoading = true
                                 progress = 0.1f
@@ -795,20 +830,41 @@ fun WebViewScreen(
                         }
 
                         setDownloadListener { downloadUrl, userAgent, contentDisposition, mimetype, contentLength ->
-                            val fileName = URLUtil.guessFileName(downloadUrl, contentDisposition, mimetype)
-                            val request = DownloadManager.Request(Uri.parse(downloadUrl)).apply {
-                                setMimeType(mimetype)
-                                val cookies = CookieManager.getInstance().getCookie(downloadUrl)
-                                addRequestHeader("cookie", cookies)
-                                addRequestHeader("User-Agent", userAgent)
-                                setDescription("Downloading file...")
-                                setTitle(fileName)
-                                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                            if (isVideoUrl(downloadUrl)) {
+                                onPlayVideo(downloadUrl)
+                            } else {
+                                // উন্নত ফাইলের নাম ডিটেকশন
+                                var fileName = URLUtil.guessFileName(downloadUrl, contentDisposition, mimetype)
+                                
+                                // যদি এক্সটেনশন .bin হয়, তবে ইউআরএল থেকে আসল এক্সটেনশন খোঁজার চেষ্টা করা
+                                if (fileName.endsWith(".bin")) {
+                                    val extension = MimeTypeMap.getFileExtensionFromUrl(downloadUrl)
+                                    if (extension.isNotEmpty()) {
+                                        fileName = fileName.substringBeforeLast(".") + "." + extension
+                                    }
+                                }
+
+                                val request = DownloadManager.Request(Uri.parse(downloadUrl)).apply {
+                                    // সঠিক MimeType সেট করা
+                                    val finalMimeType = if (mimetype == "application/octet-stream") {
+                                        MimeTypeMap.getSingleton().getMimeTypeFromExtension(
+                                            MimeTypeMap.getFileExtensionFromUrl(downloadUrl)
+                                        ) ?: mimetype
+                                    } else mimetype
+                                    
+                                    setMimeType(finalMimeType)
+                                    val cookies = CookieManager.getInstance().getCookie(downloadUrl)
+                                    addRequestHeader("cookie", cookies)
+                                    addRequestHeader("User-Agent", userAgent)
+                                    setDescription("Downloading file...")
+                                    setTitle(fileName)
+                                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                                }
+                                val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                                val id = dm.enqueue(request)
+                                onDownloadStart(id, fileName)
                             }
-                            val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                            val id = dm.enqueue(request)
-                            onDownloadStart(id, fileName)
                         }
                         
                         // Focus handling for TV remote
@@ -927,6 +983,70 @@ fun openDownloadedFile(context: Context, downloadId: Long) {
             context.startActivity(intent)
         } catch (e: Exception) {
             Toast.makeText(context, "No app found to open this file", Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+
+fun isVideoUrl(url: String): Boolean {
+    val lowUrl = url.lowercase()
+    return lowUrl.endsWith(".ts") || 
+           lowUrl.contains(".m3u8") || 
+           lowUrl.contains("/live/") || 
+           (lowUrl.contains(".js") && lowUrl.contains("as-cdn")) ||
+           lowUrl.contains("premiumtvs.space")
+}
+
+@Composable
+fun VideoPlayerScreen(url: String, onBack: () -> Unit) {
+    val context = LocalContext.current
+    val exoPlayer = remember {
+        ExoPlayer.Builder(context).build().apply {
+            val mediaItem = MediaItem.Builder()
+                .setUri(url)
+                .setMimeType(if (url.contains(".js") || url.contains("as-cdn")) androidx.media3.common.MimeTypes.APPLICATION_M3U8 else null)
+                .build()
+            setMediaItem(mediaItem)
+            prepare()
+            playWhenReady = true
+        }
+    }
+
+    // Full screen handling
+    val activity = context as? Activity
+    DisposableEffect(Unit) {
+        val originalOrientation = activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        
+        val window = activity?.window
+        val insetsController = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+        insetsController?.apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+
+        onDispose {
+            exoPlayer.release()
+            activity?.requestedOrientation = originalOrientation
+            insetsController?.show(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        AndroidView(
+            factory = {
+                PlayerView(it).apply {
+                    player = exoPlayer
+                    useController = true
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+        
+        IconButton(
+            onClick = onBack,
+            modifier = Modifier.padding(16.dp).align(Alignment.TopStart)
+        ) {
+            Icon(Icons.Default.Refresh, contentDescription = "Back", tint = Color.White)
         }
     }
 }

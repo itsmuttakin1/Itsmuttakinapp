@@ -32,6 +32,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.material.icons.rounded.Smartphone
 import androidx.compose.material.icons.rounded.Tv
@@ -40,6 +41,8 @@ import androidx.compose.material.icons.filled.Monitor
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Tv
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -77,10 +80,19 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.itsmuttakin.web.ui.theme.ItsMuttakinTheme
+import com.google.firebase.FirebaseApp
+import com.google.firebase.FirebaseOptions
+import com.google.firebase.database.FirebaseDatabase
+import com.google.firebase.database.DataSnapshot
+import com.google.firebase.database.DatabaseError
+import com.google.firebase.database.ValueEventListener
+import com.google.firebase.database.getValue
+import com.google.firebase.database.DatabaseReference
 import com.google.firebase.ktx.Firebase
 import com.google.firebase.remoteconfig.ktx.remoteConfig
 import com.google.firebase.remoteconfig.ktx.remoteConfigSettings
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import android.content.Intent
 import android.content.BroadcastReceiver
 import android.content.IntentFilter
@@ -90,12 +102,21 @@ import java.io.File
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.media3.common.MediaItem
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.ui.PlayerView
 import java.net.URLDecoder
 import androidx.media3.common.MimeTypes
 import android.webkit.JavascriptInterface
+import androidx.compose.ui.res.painterResource
+import androidx.compose.foundation.Image
 import android.webkit.MimeTypeMap
+import coil.compose.AsyncImage
+import androidx.compose.material.icons.filled.Movie
 
 data class AppStrings(
     val selectMode: String,
@@ -133,18 +154,44 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         
-        // Initialize Firebase Remote Config
-        val remoteConfig = Firebase.remoteConfig
+        // Initialize Primary Firebase
+        val primaryRemoteConfig = Firebase.remoteConfig
         val configSettings = remoteConfigSettings {
-            minimumFetchIntervalInSeconds = 0 // Instant updates
+            minimumFetchIntervalInSeconds = 0
         }
-        remoteConfig.setConfigSettingsAsync(configSettings)
-        remoteConfig.setDefaultsAsync(mapOf(
+        primaryRemoteConfig.setConfigSettingsAsync(configSettings)
+        primaryRemoteConfig.setDefaultsAsync(mapOf(
             "notice_text" to "Welcome to M BOX!",
             "latest_version_code" to 1L,
             "update_url" to "https://itsmuttakin.pages.dev/",
             "update_required" to false
         ))
+
+        // Initialize Firebase for Stats
+        val secondaryOptions = FirebaseOptions.Builder()
+            .setApiKey("AIzaSyCkJzHEPgfS5wc8HjJf6wsH9PhjV8O0Zdw")
+            .setApplicationId("1:577800510502:web:a1c6a30589521644331ae7")
+            .setDatabaseUrl("https://mrghost-53f84-default-rtdb.asia-southeast1.firebasedatabase.app")
+            .setProjectId("mrghost-53f84")
+            .build()
+        
+        try {
+            val statsApp = FirebaseApp.initializeApp(this, secondaryOptions, "stats")
+            val prefs = getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+            if (!prefs.getBoolean("is_user_counted", false)) {
+                val db = FirebaseDatabase.getInstance(statsApp).reference
+                db.child("stats/total_users").runTransaction(object : com.google.firebase.database.Transaction.Handler {
+                    override fun doTransaction(data: com.google.firebase.database.MutableData): com.google.firebase.database.Transaction.Result {
+                        val current = data.getValue(Long::class.java) ?: 0L
+                        data.value = current + 1
+                        return com.google.firebase.database.Transaction.success(data)
+                    }
+                    override fun onComplete(error: com.google.firebase.database.DatabaseError?, committed: Boolean, snapshot: com.google.firebase.database.DataSnapshot?) {
+                        if (committed) prefs.edit().putBoolean("is_user_counted", true).apply()
+                    }
+                })
+            }
+        } catch (e: Exception) {}
 
         setContent {
             // Live state for remote config
@@ -183,6 +230,8 @@ fun AppNavigation(currentLang: String, refreshTrigger: Int, onLangChange: (Strin
     val context = LocalContext.current
     val navController = rememberNavController()
     val strings = LocalStrings.current
+    val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
     
     var showUpdateDialog by remember { mutableStateOf(false) }
     var updateUrl by remember { mutableStateOf("") }
@@ -273,24 +322,26 @@ fun AppNavigation(currentLang: String, refreshTrigger: Int, onLangChange: (Strin
                     currentLang = currentLang,
                     refreshTrigger = refreshTrigger,
                     onLangChange = onLangChange,
-                    onMobileClick = { navController.navigate("webview/mobile") },
-                    onTvClick = { navController.navigate("webview/tv") }
+                    onStartClick = { navController.navigate("webview/mobile") }
                 )
             }
             composable("webview/{mode}") { backStackEntry ->
                 val mode = backStackEntry.arguments?.getString("mode") ?: "mobile"
                 WebViewScreen(
                     mode = mode,
-                    onSwitch = {
-                        val newMode = if (mode == "mobile") "tv" else "mobile"
-                        navController.navigate("webview/$newMode") {
-                            popUpTo("selection") { inclusive = false }
-                        }
-                    },
                     onBackToHome = { navController.popBackStack() },
                     onDownloadStart = { id, name -> 
                         activeDownloads.add(DownloadInfo(id, name, 0f))
-                        Toast.makeText(context, strings.downloadStarted, Toast.LENGTH_SHORT).show()
+                        scope.launch {
+                            val result = snackbarHostState.showSnackbar(
+                                message = "Downloading: $name",
+                                actionLabel = "VIEW",
+                                duration = SnackbarDuration.Short
+                            )
+                            if (result == SnackbarResult.ActionPerformed) {
+                                showDownloadSheet = true
+                            }
+                        }
                     },
                     onShowDownloads = { showDownloadSheet = true },
                     onPlayVideo = { videoUrl ->
@@ -333,9 +384,24 @@ fun AppNavigation(currentLang: String, refreshTrigger: Int, onLangChange: (Strin
             DownloadStatusDialog(
                 downloads = activeDownloads,
                 onOpen = { id -> openDownloadedFile(context, id) },
+                onCancel = { id -> 
+                    val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                    dm.remove(id) // এটি ডাউনলোড বন্ধ করবে এবং ফাইল ডিলিট করবে
+                    activeDownloads.removeIf { it.id == id }
+                },
+                onDelete = { id ->
+                    val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                    dm.remove(id) // এটি সেভ করা ফাইলটি ফোন থেকে ডিলিট করে দেবে
+                    activeDownloads.removeIf { it.id == id }
+                },
                 onDismiss = { showDownloadSheet = false }
             )
         }
+
+        SnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp)
+        )
     }
 }
 
@@ -406,171 +472,128 @@ fun PremiumUpdateDialog(url: String, progress: Float, isDownloading: Boolean, is
 }
 
 @Composable
-fun SelectionScreen(currentLang: String, refreshTrigger: Int, onLangChange: (String) -> Unit, onMobileClick: () -> Unit, onTvClick: () -> Unit) {
+fun SelectionScreen(currentLang: String, refreshTrigger: Int, onLangChange: (String) -> Unit, onStartClick: () -> Unit) {
     val strings = LocalStrings.current
-    var showLangMenu by remember { mutableStateOf(false) }
     val context = LocalContext.current
+    var progress by remember { mutableFloatStateOf(0f) }
     
-    val infiniteTransition = rememberInfiniteTransition(label = "bgTransition")
-    val gradientOffset by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1000f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(15000, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "gradient"
-    )
+    // Auto navigate after loading animation
+    LaunchedEffect(Unit) {
+        while (progress < 1f) {
+            delay(50)
+            progress += 0.02f
+        }
+        delay(500)
+        onStartClick()
+    }
 
-    val backgroundBrush = Brush.verticalGradient(
-        colors = listOf(Color(0xFF000B18), Color(0xFF001F3F), Color(0xFF000000))
-    )
-
-    Box(modifier = Modifier.fillMaxSize().background(backgroundBrush)) {
-        // Force Portrait for Home Screen
+    Box(modifier = Modifier.fillMaxSize().background(Color(0xFF0A0A0A))) {
+        // Force Portrait
         LaunchedEffect(Unit) {
             (context as? Activity)?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         }
 
-        // Decorative Neon Waves
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val path = androidx.compose.ui.graphics.Path().apply {
-                moveTo(0f, size.height * 0.3f)
-                quadraticTo(
-                    size.width * 0.5f, size.height * 0.6f,
-                    size.width, size.height * 0.4f
-                )
-            }
-            drawPath(
-                path = path,
-                color = Color.Cyan.copy(alpha = 0.2f),
-                style = androidx.compose.ui.graphics.drawscope.Stroke(width = 4.dp.toPx())
-            )
-            
-            val path2 = androidx.compose.ui.graphics.Path().apply {
-                moveTo(0f, size.height * 0.7f)
-                quadraticTo(
-                    size.width * 0.4f, size.height * 0.5f,
-                    size.width, size.height * 0.8f
-                )
-            }
-            drawPath(
-                path = path2,
-                color = Color.Cyan.copy(alpha = 0.15f),
-                style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3.dp.toPx())
-            )
-        }
-
-        IconButton(
-            onClick = { showLangMenu = true },
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(top = 48.dp, end = 24.dp)
-                .background(Color.White.copy(alpha = 0.1f), RoundedCornerShape(12.dp))
-        ) {
-            Icon(Icons.Default.Language, contentDescription = "Language", tint = Color.Cyan)
-            DropdownMenu(
-                expanded = showLangMenu,
-                onDismissRequest = { showLangMenu = false },
-                modifier = Modifier.background(Color(0xFF203A43))
-            ) {
-                translations.keys.forEach { lang ->
-                    DropdownMenuItem(
-                        text = { Text(lang, color = Color.White) },
-                        onClick = {
-                            onLangChange(lang)
-                            showLangMenu = false
-                        }
-                    )
-                }
-            }
-        }
-
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 24.dp, vertical = 48.dp),
+            modifier = Modifier.fillMaxSize().padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.SpaceBetween
+            verticalArrangement = Arrangement.Center
         ) {
-            Spacer(modifier = Modifier.height(20.dp))
-
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.weight(1f, fill = false)
+            // M BOX Logo
+            Box(
+                modifier = Modifier
+                    .size(150.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black)
+                    .border(1.dp, Color.White.copy(alpha = 0.1f), CircleShape),
+                contentAlignment = Alignment.Center
             ) {
-                AnimatedStudioText()
-                
-                Spacer(modifier = Modifier.height(24.dp))
-                
-                Text(
-                    text = strings.selectMode,
-                    color = Color.White.copy(alpha = 0.9f),
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(bottom = 20.dp).align(Alignment.CenterHorizontally)
+                Image(
+                    painter = painterResource(id = R.drawable.mbox_logo),
+                    contentDescription = "M BOX Logo",
+                    modifier = Modifier.fillMaxSize().padding(4.dp)
                 )
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(20.dp, Alignment.CenterHorizontally)
-                ) {
-                    ModeCard(
-                        title = strings.mobile,
-                        icon = Icons.Rounded.Smartphone,
-                        onClick = onMobileClick
-                    )
-                    ModeCard(
-                        title = strings.tv,
-                        icon = Icons.Rounded.Tv,
-                        onClick = onTvClick
-                    )
-                }
             }
-            
-            NoticeBoard(refreshTrigger)
+
+            Spacer(modifier = Modifier.height(48.dp))
+
+            Text(
+                text = "LOADING..",
+                color = Color.White.copy(alpha = 0.7f),
+                fontSize = 12.sp,
+                letterSpacing = 2.sp
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier
+                    .width(200.dp)
+                    .height(4.dp)
+                    .clip(RoundedCornerShape(2.dp)),
+                color = Color(0xFF7A8AFF),
+                trackColor = Color.White.copy(alpha = 0.1f)
+            )
+
+            Spacer(modifier = Modifier.height(80.dp))
+
+            // Notice Board matching the screenshot
+            PremiumNoticeBoard(refreshTrigger)
         }
     }
 }
 
 @Composable
-fun NoticeBoard(refreshTrigger: Int) {
+fun PremiumNoticeBoard(refreshTrigger: Int) {
     var noticeText by remember { mutableStateOf(Firebase.remoteConfig.getString("notice_text")) }
     
     LaunchedEffect(refreshTrigger) {
         noticeText = Firebase.remoteConfig.getString("notice_text")
     }
-    
+
     Surface(
-        color = Color.White.copy(alpha = 0.1f),
-        shape = RoundedCornerShape(30.dp),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.2f)),
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(54.dp)
+        color = Color.White.copy(alpha = 0.05f),
+        shape = RoundedCornerShape(24.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
+        modifier = Modifier.fillMaxWidth().height(280.dp)
     ) {
-        Row(
-            modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(Icons.Default.Info, contentDescription = null, tint = Color.Cyan, modifier = Modifier.size(18.dp))
-            Spacer(modifier = Modifier.width(12.dp))
-            
-            val scrollState = rememberScrollState()
-            LaunchedEffect(Unit) {
-                while(true) {
-                    scrollState.animateScrollTo(scrollState.maxValue, tween(10000, easing = LinearEasing))
-                    scrollState.scrollTo(0)
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("NOTICE BOARD", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Row {
+                    Text("Term", color = Color.White.copy(alpha = 0.5f), fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp))
+                    Text("Privacy", color = Color.White.copy(alpha = 0.5f), fontSize = 11.sp)
                 }
             }
             
             Text(
-                text = noticeText,
-                color = Color.White.copy(alpha = 0.8f),
-                fontSize = 13.sp,
-                maxLines = 1,
-                modifier = Modifier.horizontalScroll(scrollState, false)
+                "© 2024 M BOX. All rights reserved.",
+                color = Color.White.copy(alpha = 0.5f),
+                fontSize = 10.sp,
+                modifier = Modifier.padding(vertical = 4.dp)
             )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color.Black.copy(alpha = 0.3f))
+                    .padding(12.dp)
+            ) {
+                val scrollState = rememberScrollState()
+                Text(
+                    text = noticeText,
+                    color = Color.White.copy(alpha = 0.8f),
+                    fontSize = 13.sp,
+                    modifier = Modifier.verticalScroll(scrollState)
+                )
+            }
         }
     }
 }
@@ -651,7 +674,6 @@ fun ModeCard(title: String, icon: ImageVector, onClick: () -> Unit) {
 @Composable
 fun WebViewScreen(
     mode: String, 
-    onSwitch: () -> Unit, 
     onBackToHome: () -> Unit,
     onDownloadStart: (Long, String) -> Unit,
     onShowDownloads: () -> Unit,
@@ -659,7 +681,7 @@ fun WebViewScreen(
 ) {
     val context = LocalContext.current
     val strings = LocalStrings.current
-    val url = if (mode == "mobile") "https://itsmuttakin.pages.dev/" else "https://muttakintv.pages.dev/"
+    val url = "https://itsmuttakin.pages.dev/"
     var isLoading by remember { mutableStateOf(true) }
     var progress by remember { mutableFloatStateOf(0f) }
     var webView: WebView? by remember { mutableStateOf(null) }
@@ -680,14 +702,9 @@ fun WebViewScreen(
         }
     }
 
-    // Lock orientation for TV
-    LaunchedEffect(mode) {
-        val activity = context as? Activity
-        if (mode == "tv") {
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-        } else {
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        }
+    // Fixed to mobile orientation or unspecified for general web
+    LaunchedEffect(Unit) {
+        (context as? Activity)?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     }
 
     val backCallback = remember(webView, customView) {
@@ -714,18 +731,35 @@ fun WebViewScreen(
 
     Scaffold(
         topBar = {
-            if (mode == "mobile" && customView == null) {
+            if (customView == null) {
                 TopAppBar(
-                    title = { Text(strings.mobileMode, color = Color.White, fontSize = 18.sp) },
+                    title = { 
+                        val infiniteTransition = rememberInfiniteTransition(label = "titleGlow")
+                        val animatedColor by infiniteTransition.animateColor(
+                            initialValue = Color.Cyan,
+                            targetValue = Color(0xFF00FF9D), // Light Greenish Blue
+                            animationSpec = infiniteRepeatable(
+                                animation = tween(2000, easing = LinearEasing),
+                                repeatMode = RepeatMode.Reverse
+                            ),
+                            label = "color"
+                        )
+                        Text(
+                            text = "M BOX",
+                            color = Color.White,
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            letterSpacing = 1.sp,
+                            style = androidx.compose.ui.text.TextStyle(
+                                shadow = androidx.compose.ui.graphics.Shadow(
+                                    color = animatedColor,
+                                    blurRadius = 15f
+                                )
+                            )
+                        )
+                    },
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF0F2027)),
                     actions = {
-                        IconButton(onClick = onSwitch) {
-                            Icon(
-                                imageVector = Icons.Default.Tv,
-                                contentDescription = "Switch to TV",
-                                tint = Color.Cyan
-                            )
-                        }
                         IconButton(onClick = onShowDownloads) {
                             Icon(Icons.Default.Download, contentDescription = "Downloads", tint = Color.White)
                         }
@@ -769,11 +803,6 @@ fun WebViewScreen(
                                 }
                             }
                         }, "Android")
-
-                        // User Agent for TV
-                        if (mode == "tv") {
-                            settings.userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-                        }
 
                         webViewClient = object : WebViewClient() {
                             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -821,11 +850,7 @@ fun WebViewScreen(
                             override fun onHideCustomView() {
                                 customView = null
                                 val activity = context as? Activity
-                                if (mode == "tv") {
-                                    activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-                                } else {
-                                    activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-                                }
+                                activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                             }
                         }
 
@@ -903,7 +928,13 @@ fun WebViewScreen(
 }
 
 @Composable
-fun DownloadStatusDialog(downloads: List<DownloadInfo>, onOpen: (Long) -> Unit, onDismiss: () -> Unit) {
+fun DownloadStatusDialog(
+    downloads: List<DownloadInfo>, 
+    onOpen: (Long) -> Unit, 
+    onCancel: (Long) -> Unit, 
+    onDelete: (Long) -> Unit,
+    onDismiss: () -> Unit
+) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Downloads", color = Color.Cyan, fontWeight = FontWeight.Bold) },
@@ -932,8 +963,17 @@ fun DownloadStatusDialog(downloads: List<DownloadInfo>, onOpen: (Long) -> Unit, 
                                 }
                             }
                             if (download.isFinished) {
-                                TextButton(onClick = { onOpen(download.id) }) {
-                                    Text("Open", color = Color.Cyan, fontWeight = FontWeight.Bold)
+                                Row {
+                                    TextButton(onClick = { onOpen(download.id) }) {
+                                        Text("Open", color = Color.Cyan, fontWeight = FontWeight.Bold)
+                                    }
+                                    IconButton(onClick = { onDelete(download.id) }) {
+                                        Icon(Icons.Default.Delete, contentDescription = "Delete", tint = Color.Red.copy(alpha = 0.7f))
+                                    }
+                                }
+                            } else {
+                                IconButton(onClick = { onCancel(download.id) }) {
+                                    Icon(Icons.Default.Close, contentDescription = "Cancel", tint = Color.Red.copy(alpha = 0.7f))
                                 }
                             }
                         }
@@ -996,16 +1036,49 @@ fun isVideoUrl(url: String): Boolean {
            lowUrl.contains("premiumtvs.space")
 }
 
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
 fun VideoPlayerScreen(url: String, onBack: () -> Unit) {
     val context = LocalContext.current
     val exoPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
-            val mediaItem = MediaItem.Builder()
-                .setUri(url)
-                .setMimeType(if (url.contains(".js") || url.contains("as-cdn")) androidx.media3.common.MimeTypes.APPLICATION_M3U8 else null)
-                .build()
-            setMediaItem(mediaItem)
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+            .build()
+
+        // উন্নত বাফারিং কন্ট্রোল
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                30000, // Min buffer to start
+                60000, // Max buffer
+                2500,  // Buffer to start playback
+                5000   // Buffer after rebuffering
+            )
+            .build()
+
+        ExoPlayer.Builder(context)
+            .setAudioAttributes(audioAttributes, true)
+            .setLoadControl(loadControl)
+            .setWakeMode(C.WAKE_MODE_NETWORK)
+            .build().apply {
+            val isHls = url.contains(".m3u8") || url.contains(".js") || url.contains("as-cdn")
+            
+            val dataSourceFactory = DefaultHttpDataSource.Factory()
+                .setAllowCrossProtocolRedirects(true)
+                .setConnectTimeoutMs(15000) // টাইমআউট বাড়ানো হয়েছে
+                .setReadTimeoutMs(15000)
+                .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+            
+            if (isHls) {
+                val mediaSource = androidx.media3.exoplayer.hls.HlsMediaSource.Factory(dataSourceFactory)
+                    .createMediaSource(MediaItem.fromUri(url))
+                setMediaSource(mediaSource)
+            } else {
+                setMediaItem(MediaItem.fromUri(url))
+            }
+            
+            repeatMode = Player.REPEAT_MODE_ALL // এরর হলেও লুপ করার চেষ্টা করবে
             prepare()
             playWhenReady = true
         }
@@ -1037,6 +1110,7 @@ fun VideoPlayerScreen(url: String, onBack: () -> Unit) {
                 PlayerView(it).apply {
                     player = exoPlayer
                     useController = true
+                    keepScreenOn = true // এটি ভিডিও চলাকালীন স্ক্রিন বন্ধ হতে দেবে না
                 }
             },
             modifier = Modifier.fillMaxSize()

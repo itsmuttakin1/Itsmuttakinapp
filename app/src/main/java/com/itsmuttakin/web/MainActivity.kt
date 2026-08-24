@@ -6,7 +6,6 @@ import android.content.Context
 import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.os.Bundle
-import android.view.KeyEvent
 import android.view.ViewGroup
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -21,6 +20,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
+import androidx.compose.foundation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -31,11 +31,9 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.material.icons.rounded.Smartphone
-import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Monitor
 import androidx.compose.material.icons.filled.Language
@@ -43,7 +41,6 @@ import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Tv
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -94,10 +91,25 @@ import com.google.firebase.remoteconfig.ktx.remoteConfigSettings
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import android.content.Intent
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import androidx.core.app.NotificationCompat
+import android.content.pm.PackageManager
+import androidx.core.app.ActivityCompat
+import com.google.firebase.messaging.FirebaseMessaging
 import android.content.BroadcastReceiver
 import android.content.IntentFilter
 import android.database.Cursor
 import androidx.core.content.FileProvider
+import android.os.Build
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.net.URL
+import android.graphics.BitmapFactory
+import androidx.core.content.edit
 import java.io.File
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -116,7 +128,16 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.foundation.Image
 import android.webkit.MimeTypeMap
 import coil.compose.AsyncImage
-import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Fullscreen
+import androidx.compose.material.icons.filled.FullscreenExit
+import java.util.Locale
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Pause
+import androidx.activity.compose.BackHandler
+import androidx.core.content.ContextCompat
 
 data class AppStrings(
     val selectMode: String,
@@ -149,10 +170,31 @@ val translations = mapOf(
 
 val LocalStrings = staticCompositionLocalOf { translations["English"]!! }
 
+// Global states for stats
+val totalUsersState = mutableLongStateOf(0L)
+val newUsersState = mutableLongStateOf(0L)
+val onlineUsersState = mutableLongStateOf(0L)
+val versionUsersState = mutableLongStateOf(0L)
+
+
+// App Update States
+val latestVersionCodeState = mutableLongStateOf(0L)
+val updateUrlState = mutableStateOf("")
+val updateRequiredState = mutableStateOf(false)
+val updateMessageState = mutableStateOf("")
+
 class MainActivity : ComponentActivity() {
+    private var wakeLock: android.os.PowerManager.WakeLock? = null
+
+    @SuppressLint("InvalidWakeLockTag")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        
+        // Background Play এর জন্য WakeLock সক্রিয় করা
+        val powerManager = getSystemService(POWER_SERVICE) as android.os.PowerManager
+        wakeLock = powerManager.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "MBOX:WakeLock")
+        wakeLock?.acquire(10 * 60 * 60 * 1000L) // ১০ ঘণ্টা পর অটো রিলিজ হবে (সেফটি)
         
         // Initialize Primary Firebase
         val primaryRemoteConfig = Firebase.remoteConfig
@@ -167,30 +209,159 @@ class MainActivity : ComponentActivity() {
             "update_required" to false
         ))
 
-        // Initialize Firebase for Stats
+        // Initialize Firebase for Stats - New Firebase Config
         val secondaryOptions = FirebaseOptions.Builder()
-            .setApiKey("AIzaSyCkJzHEPgfS5wc8HjJf6wsH9PhjV8O0Zdw")
-            .setApplicationId("1:577800510502:web:a1c6a30589521644331ae7")
-            .setDatabaseUrl("https://mrghost-53f84-default-rtdb.asia-southeast1.firebasedatabase.app")
-            .setProjectId("mrghost-53f84")
+            .setApiKey("AIzaSyB4nvhHK1f4nxyJ6fnLV9tlyUMK-dUIB3g")
+            .setApplicationId("1:804285355395:web:307cfeaabac8423a1b92b6")
+            .setDatabaseUrl("https://itsmuttakin-adf2b-default-rtdb.asia-southeast1.firebasedatabase.app")
+            .setProjectId("itsmuttakin-adf2b")
             .build()
         
         try {
             val statsApp = FirebaseApp.initializeApp(this, secondaryOptions, "stats")
-            val prefs = getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
-            if (!prefs.getBoolean("is_user_counted", false)) {
-                val db = FirebaseDatabase.getInstance(statsApp).reference
-                db.child("stats/total_users").runTransaction(object : com.google.firebase.database.Transaction.Handler {
+            val db = FirebaseDatabase.getInstance(statsApp).reference
+            val prefs = getSharedPreferences("app_prefs", MODE_PRIVATE)
+
+            // Subscribe to a topic for mass notifications
+            FirebaseMessaging.getInstance().subscribeToTopic("all_users")
+            
+            // Notification Permission for Android 13+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
+                }
+            }
+
+            // Listen for System Notifications from Primary RTDB (mrghost)
+            val primaryDb = FirebaseDatabase.getInstance("https://mrghost-53f84-default-rtdb.asia-southeast1.firebasedatabase.app").reference
+            primaryDb.child("system_notifications").addValueEventListener(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    if (!snapshot.exists()) return
+                    
+                    val title = snapshot.child("title").getValue(String::class.java) ?: ""
+                    val message = snapshot.child("message").getValue(String::class.java) ?: ""
+                    val imageUrl = snapshot.child("image_url").getValue(String::class.java) ?: ""
+                    val timestamp = snapshot.child("timestamp").getValue(Long::class.java) ?: 0L
+
+                    val lastNotifTime = prefs.getLong("last_notif_timestamp", 0L)
+
+                    // যদি নতুন কোনো নোটিফিকেশন হয় অথবা ইউজার অনেকদিন পর অনলাইনে আসে
+                    if (timestamp > lastNotifTime && title.isNotEmpty()) {
+                        showSystemNotification(title, message, imageUrl)
+                        // শুধুমাত্র দেখানোর পরেই টাইমস্ট্যাম্প আপডেট করা হবে
+                        prefs.edit().putLong("last_notif_timestamp", timestamp).apply()
+                    }
+                }
+                override fun onCancelled(error: DatabaseError) {}
+            })
+
+            // Version-wise User Counting (For tracking updates)
+            val pInfo = packageManager.getPackageInfo(packageName, 0)
+            val currentVersion = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                pInfo.longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                pInfo.versionCode.toLong()
+            }
+            val lastVersionCounted = prefs.getLong("last_version_counted", -1L)
+
+            if (currentVersion > lastVersionCounted) {
+                db.child("stats/version_users/$currentVersion").runTransaction(object : com.google.firebase.database.Transaction.Handler {
                     override fun doTransaction(data: com.google.firebase.database.MutableData): com.google.firebase.database.Transaction.Result {
                         val current = data.getValue(Long::class.java) ?: 0L
                         data.value = current + 1
                         return com.google.firebase.database.Transaction.success(data)
                     }
-                    override fun onComplete(error: com.google.firebase.database.DatabaseError?, committed: Boolean, snapshot: com.google.firebase.database.DataSnapshot?) {
-                        if (committed) prefs.edit().putBoolean("is_user_counted", true).apply()
+                    override fun onComplete(error: DatabaseError?, committed: Boolean, snapshot: DataSnapshot?) {
+                        if (committed) prefs.edit { putLong("last_version_counted", currentVersion) }
                     }
                 })
             }
+            
+            // Total and New User Counting
+            if (!prefs.getBoolean("is_user_counted", false)) {
+                // Increment Total Users
+                db.child("stats/total_users").runTransaction(object : com.google.firebase.database.Transaction.Handler {
+                    override fun doTransaction(data: com.google.firebase.database.MutableData): com.google.firebase.database.Transaction.Result {
+                        var current = data.getValue(Long::class.java)
+                        if (current == null || current < 125L) current = 125L
+                        data.value = current + 1
+                        return com.google.firebase.database.Transaction.success(data)
+                    }
+                    override fun onComplete(error: DatabaseError?, committed: Boolean, snapshot: DataSnapshot?) {}
+                })
+
+                // Increment New Users
+                db.child("stats/new_users").runTransaction(object : com.google.firebase.database.Transaction.Handler {
+                    override fun doTransaction(data: com.google.firebase.database.MutableData): com.google.firebase.database.Transaction.Result {
+                        val current = data.getValue(Long::class.java) ?: 0L
+                        data.value = current + 1
+                        return com.google.firebase.database.Transaction.success(data)
+                    }
+                    override fun onComplete(error: DatabaseError?, committed: Boolean, snapshot: DataSnapshot?) {
+                        if (committed) prefs.edit { putBoolean("is_user_counted", true) }
+                    }
+                })
+            }
+
+            // Online User Tracking
+            val userId = prefs.getString("user_id", null) ?: java.util.UUID.randomUUID().toString().also { 
+                prefs.edit { putString("user_id", it) } 
+            }
+            val onlineRef = db.child("stats/online_users").child(userId)
+            
+            // Handle connectivity
+            db.child(".info/connected").addValueEventListener(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    val connected = snapshot.getValue(Boolean::class.java) ?: false
+                    if (connected) {
+                        onlineRef.setValue(true)
+                        onlineRef.onDisconnect().removeValue()
+                    }
+                }
+                override fun onCancelled(error: DatabaseError) {}
+            })
+
+            // Listen for changes to show in UI
+            db.child("stats/total_users").addValueEventListener(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    totalUsersState.longValue = snapshot.getValue(Long::class.java) ?: 0L
+                }
+                override fun onCancelled(error: DatabaseError) {}
+            })
+
+            db.child("stats/new_users").addValueEventListener(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    newUsersState.longValue = snapshot.getValue(Long::class.java) ?: 0L
+                }
+                override fun onCancelled(error: DatabaseError) {}
+            })
+
+            db.child("stats/online_users").addValueEventListener(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    onlineUsersState.longValue = snapshot.childrenCount
+                }
+                override fun onCancelled(error: DatabaseError) {}
+            })
+
+            db.child("stats/version_users/$currentVersion").addValueEventListener(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    versionUsersState.longValue = snapshot.getValue(Long::class.java) ?: 0L
+                }
+                override fun onCancelled(error: DatabaseError) {}
+            })
+
+            // Listen for App Updates
+            db.child("app_update").addValueEventListener(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    latestVersionCodeState.longValue = snapshot.child("latest_version_code").getValue(Long::class.java) ?: 0L
+                    updateUrlState.value = snapshot.child("update_url").getValue(String::class.java) ?: ""
+                    updateRequiredState.value = snapshot.child("update_required").getValue(Boolean::class.java) ?: false
+                    updateMessageState.value = snapshot.child("update_message").getValue(String::class.java) ?: ""
+                }
+                override fun onCancelled(error: DatabaseError) {}
+            })
+
         } catch (e: Exception) {}
 
         setContent {
@@ -223,6 +394,117 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    private fun showSystemNotification(title: String, message: String, imageUrl: String = "") {
+        val channelId = "mbox_notifications"
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(channelId, "M BOX News", NotificationManager.IMPORTANCE_HIGH)
+            notificationManager.createNotificationChannel(channel)
+        }
+
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        }
+        val pendingIntent = PendingIntent.getActivity(this, 0, intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+
+        val notificationBuilder = NotificationCompat.Builder(this, channelId)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(title)
+            .setContentText(message)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+
+        if (imageUrl.isNotEmpty()) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                try {
+                    val url = URL(imageUrl)
+                    val bitmap = BitmapFactory.decodeStream(url.openConnection().getInputStream())
+                    withContext(Dispatchers.Main) {
+                        notificationBuilder.setLargeIcon(bitmap)
+                        notificationBuilder.setStyle(NotificationCompat.BigPictureStyle().bigPicture(bitmap).bigLargeIcon(null as android.graphics.Bitmap?))
+                        notificationManager.notify(timestampId(), notificationBuilder.build())
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        notificationManager.notify(timestampId(), notificationBuilder.build())
+                    }
+                }
+            }
+        } else {
+            notificationManager.notify(timestampId(), notificationBuilder.build())
+        }
+    }
+
+    private fun timestampId(): Int = System.currentTimeMillis().toInt()
+
+    override fun onDestroy() {
+        super.onDestroy()
+        wakeLock?.let {
+            if (it.isHeld) it.release()
+        }
+    }
+}
+
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AdminScreen(onBack: () -> Unit) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("M BOX ADMIN", color = Color.White, fontWeight = FontWeight.Bold) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Color.White)
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF0F2027))
+            )
+        },
+        containerColor = Color.Black
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            StatsCard("Total Users", "${totalUsersState.longValue}", Color(0xFF7A8AFF))
+            StatsCard("New Users", "${newUsersState.longValue}", Color(0xFF00F5FF))
+            StatsCard("Online Users", "${onlineUsersState.longValue}", Color(0xFF4CAF50))
+            StatsCard("Current Version Users", "${versionUsersState.longValue}", Color(0xFFFF9800))
+            
+            Spacer(modifier = Modifier.height(32.dp))
+            
+            Text(
+                "Real-time analytics from Firebase",
+                color = Color.White.copy(alpha = 0.5f),
+                fontSize = 12.sp
+            )
+        }
+    }
+}
+
+@Composable
+fun StatsCard(label: String, value: String, color: Color) {
+    Surface(
+        color = Color.White.copy(alpha = 0.05f),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, color.copy(alpha = 0.3f)),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(20.dp)) {
+            Text(label.uppercase(), color = color, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(value, color = Color.White, fontSize = 32.sp, fontWeight = FontWeight.ExtraBold)
+        }
+    }
 }
 
 @Composable
@@ -239,6 +521,21 @@ fun AppNavigation(currentLang: String, refreshTrigger: Int, onLangChange: (Strin
     var updateProgress by remember { mutableFloatStateOf(0f) }
     var isUpdateDownloading by remember { mutableStateOf(false) }
     var isUpdateRequired by remember { mutableStateOf(false) }
+
+    // State to handle video player as an overlay/banner
+    var playingVideoUrl by remember { mutableStateOf<String?>(null) }
+    var isPlayerLandscape by remember { mutableStateOf(false) }
+
+    // Orientation handling for player
+    LaunchedEffect(isPlayerLandscape) {
+        if (playingVideoUrl != null) {
+            (context as? Activity)?.requestedOrientation = if (isPlayerLandscape) {
+                ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            } else {
+                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            }
+        }
+    }
 
     // Receiver to handle all downloads
     val activeDownloads = remember<SnapshotStateList<DownloadInfo>> { mutableStateListOf() }
@@ -265,7 +562,8 @@ fun AppNavigation(currentLang: String, refreshTrigger: Int, onLangChange: (Strin
     }
 
     DisposableEffect(Unit) {
-        context.registerReceiver(downloadReceiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE), Context.RECEIVER_EXPORTED)
+        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+        ContextCompat.registerReceiver(context, downloadReceiver, filter, ContextCompat.RECEIVER_EXPORTED)
         onDispose {
             context.unregisterReceiver(downloadReceiver)
         }
@@ -295,11 +593,9 @@ fun AppNavigation(currentLang: String, refreshTrigger: Int, onLangChange: (Strin
         }
     }
     
-    // Check for Updates via Remote Config
-    LaunchedEffect(refreshTrigger) {
-        val remoteConfig = Firebase.remoteConfig
-        val latestVersion = remoteConfig.getLong("latest_version_code")
-        val updateRequired = remoteConfig.getBoolean("update_required")
+    // Check for Updates via Realtime Database (controlled by adpc)
+    LaunchedEffect(latestVersionCodeState.longValue, refreshTrigger) {
+        val latestVersion = latestVersionCodeState.longValue
         val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
         val currentVersion = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
             pInfo.longVersionCode
@@ -309,56 +605,88 @@ fun AppNavigation(currentLang: String, refreshTrigger: Int, onLangChange: (Strin
         }
 
         if (latestVersion > currentVersion && !isUpdateDownloading) {
-            updateUrl = remoteConfig.getString("update_url")
-            isUpdateRequired = updateRequired
+            updateUrl = updateUrlState.value
+            isUpdateRequired = updateRequiredState.value
             showUpdateDialog = true
         }
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        NavHost(navController = navController, startDestination = "selection") {
-            composable("selection") {
-                SelectionScreen(
-                    currentLang = currentLang,
-                    refreshTrigger = refreshTrigger,
-                    onLangChange = onLangChange,
-                    onStartClick = { navController.navigate("webview/mobile") }
-                )
-            }
-            composable("webview/{mode}") { backStackEntry ->
-                val mode = backStackEntry.arguments?.getString("mode") ?: "mobile"
-                WebViewScreen(
-                    mode = mode,
-                    onBackToHome = { navController.popBackStack() },
-                    onDownloadStart = { id, name -> 
-                        activeDownloads.add(DownloadInfo(id, name, 0f))
-                        scope.launch {
-                            val result = snackbarHostState.showSnackbar(
-                                message = "Downloading: $name",
-                                actionLabel = "VIEW",
-                                duration = SnackbarDuration.Short
-                            )
-                            if (result == SnackbarResult.ActionPerformed) {
-                                showDownloadSheet = true
-                            }
-                        }
-                    },
-                    onShowDownloads = { showDownloadSheet = true },
-                    onPlayVideo = { videoUrl ->
-                        val encodedUrl = Uri.encode(videoUrl)
-                        navController.navigate("player/$encodedUrl")
+        Column(modifier = Modifier.fillMaxSize()) {
+            // Video Player in Portrait (Integrated as a Banner)
+            if (playingVideoUrl != null && !isPlayerLandscape) {
+                VideoPlayerScreen(
+                    url = playingVideoUrl!!,
+                    isLandscape = false,
+                    onToggleRotation = { isPlayerLandscape = true },
+                    onBack = { 
+                        playingVideoUrl = null 
+                        isPlayerLandscape = false
+                        (context as? Activity)?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                     }
                 )
             }
-            composable("player/{url}") { backStackEntry ->
-                val videoUrl = backStackEntry.arguments?.getString("url")?.let { URLDecoder.decode(it, "UTF-8") } ?: ""
-                VideoPlayerScreen(url = videoUrl, onBack = { navController.popBackStack() })
+
+            Box(modifier = Modifier.weight(1f)) {
+                NavHost(navController = navController, startDestination = "selection") {
+                    composable("selection") {
+                        SelectionScreen(
+                            refreshTrigger = refreshTrigger,
+                            onStartClick = { navController.navigate("webview/mobile") },
+                            onAdminClick = { navController.navigate("admin") }
+                        )
+                    }
+                    composable("admin") {
+                        AdminScreen(onBack = { navController.popBackStack() })
+                    }
+                    composable("webview/{mode}") {
+                        WebViewScreen(
+                            isPlayerActive = playingVideoUrl != null,
+                            onBackToHome = { navController.popBackStack() },
+                            onDownloadStart = { id, name -> 
+                                activeDownloads.add(DownloadInfo(id, name, 0f))
+                                scope.launch {
+                                    val result = snackbarHostState.showSnackbar(
+                                        message = "Downloading: $name",
+                                        actionLabel = "VIEW",
+                                        duration = SnackbarDuration.Short
+                                    )
+                                    if (result == SnackbarResult.ActionPerformed) {
+                                        showDownloadSheet = true
+                                    }
+                                }
+                            },
+                            onShowDownloads = { showDownloadSheet = true },
+                            onPlayVideo = { videoUrl ->
+                                playingVideoUrl = videoUrl
+                            },
+                            onClosePlayer = {
+                                playingVideoUrl = null
+                                isPlayerLandscape = false
+                                (context as? Activity)?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                            }
+                        )
+                    }
+                }
+
+                // Video Player in Landscape (Overlay)
+                if (playingVideoUrl != null && isPlayerLandscape) {
+                    VideoPlayerScreen(
+                        url = playingVideoUrl!!,
+                        isLandscape = true,
+                        onToggleRotation = { isPlayerLandscape = false },
+                        onBack = { 
+                            playingVideoUrl = null 
+                            isPlayerLandscape = false
+                            (context as? Activity)?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                        }
+                    )
+                }
             }
         }
         
         if (showUpdateDialog) {
             PremiumUpdateDialog(
-                url = updateUrl,
                 progress = updateProgress,
                 isDownloading = isUpdateDownloading,
                 isForceUpdate = isUpdateRequired,
@@ -406,9 +734,8 @@ fun AppNavigation(currentLang: String, refreshTrigger: Int, onLangChange: (Strin
 }
 
 @Composable
-fun PremiumUpdateDialog(url: String, progress: Float, isDownloading: Boolean, isForceUpdate: Boolean, onStartDownload: () -> Unit, onDismiss: () -> Unit) {
+fun PremiumUpdateDialog(progress: Float, isDownloading: Boolean, isForceUpdate: Boolean, onStartDownload: () -> Unit, onDismiss: () -> Unit) {
     val strings = LocalStrings.current
-    val context = LocalContext.current
     
     AlertDialog(
         onDismissRequest = { if (!isForceUpdate) onDismiss() },
@@ -428,7 +755,9 @@ fun PremiumUpdateDialog(url: String, progress: Float, isDownloading: Boolean, is
         text = {
             Column {
                 Text(
-                    text = if (isDownloading) "Please wait while we download the latest version." else strings.updateText,
+                    text = if (isDownloading) "Please wait while we download the latest version." 
+                           else if (updateMessageState.value.isNotEmpty()) updateMessageState.value 
+                           else strings.updateText,
                     color = Color.White.copy(alpha = 0.8f),
                     fontSize = 15.sp
                 )
@@ -471,9 +800,9 @@ fun PremiumUpdateDialog(url: String, progress: Float, isDownloading: Boolean, is
     )
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun SelectionScreen(currentLang: String, refreshTrigger: Int, onLangChange: (String) -> Unit, onStartClick: () -> Unit) {
-    val strings = LocalStrings.current
+fun SelectionScreen(refreshTrigger: Int, onStartClick: () -> Unit, onAdminClick: () -> Unit) {
     val context = LocalContext.current
     var progress by remember { mutableFloatStateOf(0f) }
     
@@ -487,6 +816,30 @@ fun SelectionScreen(currentLang: String, refreshTrigger: Int, onLangChange: (Str
         onStartClick()
     }
 
+    val infiniteTransition = rememberInfiniteTransition(label = "uiAnim")
+    
+    // Smooth Scale Animation
+    val scale by infiniteTransition.animateFloat(
+        initialValue = 0.96f,
+        targetValue = 1.04f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2000, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "scale"
+    )
+
+    // Animated Glow Color
+    val animatedColor by infiniteTransition.animateColor(
+        initialValue = Color(0xFF00F5FF),
+        targetValue = Color(0xFF00FF9D),
+        animationSpec = infiniteRepeatable(
+            animation = tween(3000, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "glowColor"
+    )
+
     Box(modifier = Modifier.fillMaxSize().background(Color(0xFF0A0A0A))) {
         // Force Portrait
         LaunchedEffect(Unit) {
@@ -498,13 +851,15 @@ fun SelectionScreen(currentLang: String, refreshTrigger: Int, onLangChange: (Str
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            // M BOX Logo
+            // M BOX Logo with Animated Glow Border
             Box(
                 modifier = Modifier
-                    .size(150.dp)
+                    .size(160.dp)
+                    .graphicsLayer(scaleX = scale, scaleY = scale)
                     .clip(CircleShape)
                     .background(Color.Black)
-                    .border(1.dp, Color.White.copy(alpha = 0.1f), CircleShape),
+                    .border(2.dp, animatedColor.copy(alpha = 0.6f), CircleShape)
+                    .shadow(elevation = 20.dp, shape = CircleShape, ambientColor = animatedColor, spotColor = animatedColor),
                 contentAlignment = Alignment.Center
             ) {
                 Image(
@@ -518,33 +873,35 @@ fun SelectionScreen(currentLang: String, refreshTrigger: Int, onLangChange: (Str
 
             Text(
                 text = "LOADING..",
-                color = Color.White.copy(alpha = 0.7f),
+                color = animatedColor.copy(alpha = 0.8f),
                 fontSize = 12.sp,
-                letterSpacing = 2.sp
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 3.sp
             )
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(16.dp))
 
             LinearProgressIndicator(
                 progress = { progress },
                 modifier = Modifier
-                    .width(200.dp)
-                    .height(4.dp)
-                    .clip(RoundedCornerShape(2.dp)),
-                color = Color(0xFF7A8AFF),
-                trackColor = Color.White.copy(alpha = 0.1f)
+                    .width(220.dp)
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(3.dp)),
+                color = animatedColor,
+                trackColor = Color.White.copy(alpha = 0.05f)
             )
 
             Spacer(modifier = Modifier.height(80.dp))
 
-            // Notice Board matching the screenshot
-            PremiumNoticeBoard(refreshTrigger)
+            // Notice Board
+            PremiumNoticeBoard(refreshTrigger, animatedColor)
         }
     }
+
 }
 
 @Composable
-fun PremiumNoticeBoard(refreshTrigger: Int) {
+fun PremiumNoticeBoard(refreshTrigger: Int, borderColor: Color) {
     var noticeText by remember { mutableStateOf(Firebase.remoteConfig.getString("notice_text")) }
     
     LaunchedEffect(refreshTrigger) {
@@ -552,50 +909,49 @@ fun PremiumNoticeBoard(refreshTrigger: Int) {
     }
 
     Surface(
-        color = Color.White.copy(alpha = 0.05f),
-        shape = RoundedCornerShape(24.dp),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
-        modifier = Modifier.fillMaxWidth().height(280.dp)
+        color = Color.White.copy(alpha = 0.03f),
+        shape = RoundedCornerShape(28.dp),
+        border = BorderStroke(1.dp, borderColor.copy(alpha = 0.3f)),
+        modifier = Modifier.fillMaxWidth().height(260.dp)
     ) {
-        Column(modifier = Modifier.padding(16.dp)) {
+        Column(modifier = Modifier.padding(20.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("NOTICE BOARD", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Text("SYSTEM NOTICE", color = borderColor, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp)
                 Row {
-                    Text("Term", color = Color.White.copy(alpha = 0.5f), fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp))
-                    Text("Privacy", color = Color.White.copy(alpha = 0.5f), fontSize = 11.sp)
+                    Text("Term", color = Color.White.copy(alpha = 0.4f), fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp))
+                    Text("Privacy", color = Color.White.copy(alpha = 0.4f), fontSize = 11.sp)
                 }
             }
             
-            Text(
-                "© 2024 M BOX. All rights reserved.",
-                color = Color.White.copy(alpha = 0.5f),
-                fontSize = 10.sp,
-                modifier = Modifier.padding(vertical = 4.dp)
+            HorizontalDivider(
+                color = Color.White.copy(alpha = 0.05f),
+                thickness = 1.dp,
+                modifier = Modifier.padding(vertical = 12.dp)
             )
-
-            Spacer(modifier = Modifier.height(8.dp))
 
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(Color.Black.copy(alpha = 0.3f))
-                    .padding(12.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Color.Black.copy(alpha = 0.2f))
+                    .padding(14.dp)
             ) {
                 val scrollState = rememberScrollState()
                 Text(
                     text = noticeText,
-                    color = Color.White.copy(alpha = 0.8f),
+                    color = Color.White.copy(alpha = 0.9f),
                     fontSize = 13.sp,
+                    lineHeight = 20.sp,
                     modifier = Modifier.verticalScroll(scrollState)
                 )
             }
         }
     }
+
 }
 
 @Composable
@@ -667,17 +1023,19 @@ fun ModeCard(title: String, icon: ImageVector, onClick: () -> Unit) {
             )
         }
     }
+
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun WebViewScreen(
-    mode: String, 
+    isPlayerActive: Boolean,
     onBackToHome: () -> Unit,
     onDownloadStart: (Long, String) -> Unit,
     onShowDownloads: () -> Unit,
-    onPlayVideo: (String) -> Unit
+    onPlayVideo: (String) -> Unit,
+    onClosePlayer: () -> Unit
 ) {
     val context = LocalContext.current
     val strings = LocalStrings.current
@@ -707,10 +1065,13 @@ fun WebViewScreen(
         (context as? Activity)?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     }
 
-    val backCallback = remember(webView, customView) {
+    val backCallback = remember(webView, customView, isPlayerActive) {
         object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (customView != null) {
+                if (isPlayerActive) {
+                    webView?.evaluateJavascript("if(window.onAndroidPlayerClosed) { window.onAndroidPlayerClosed(); }", null)
+                    onClosePlayer()
+                } else if (customView != null) {
                     webView?.webChromeClient?.onHideCustomView()
                 } else if (webView?.canGoBack() == true) {
                     webView?.goBack()
@@ -731,7 +1092,8 @@ fun WebViewScreen(
 
     Scaffold(
         topBar = {
-            if (customView == null) {
+            // Hide App TopBar when player is integrated to save space
+            if (customView == null && !isPlayerActive) {
                 TopAppBar(
                     title = { 
                         val infiniteTransition = rememberInfiniteTransition(label = "titleGlow")
@@ -793,6 +1155,8 @@ fun WebViewScreen(
                         settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                         settings.allowFileAccess = true
                         settings.allowContentAccess = true
+                        settings.mediaPlaybackRequiresUserGesture = false
+                        settings.javaScriptCanOpenWindowsAutomatically = true
                         
                         // Add JavaScript Interface
                         addJavascriptInterface(object {
@@ -802,15 +1166,39 @@ fun WebViewScreen(
                                     onPlayVideo(videoUrl)
                                 }
                             }
+                            
+                            @JavascriptInterface
+                            fun downloadFile(url: String, fileName: String) {
+                                (context as? Activity)?.runOnUiThread {
+                                    val request = DownloadManager.Request(Uri.parse(url)).apply {
+                                        setTitle(fileName)
+                                        setDescription("Downloading via M BOX...")
+                                        setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                                        setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                                        
+                                        // Add current cookies and UA for better compatibility
+                                        val cookies = CookieManager.getInstance().getCookie(url)
+                                        addRequestHeader("cookie", cookies)
+                                        addRequestHeader("User-Agent", settings.userAgentString)
+                                    }
+                                    val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                                    val id = dm.enqueue(request)
+                                    onDownloadStart(id, fileName)
+                                }
+                            }
                         }, "Android")
 
                         webViewClient = object : WebViewClient() {
                             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                                 val url = request?.url?.toString() ?: ""
-                                if (isVideoUrl(url)) {
+                                
+                                // যদি ইউটিউব লিঙ্ক হয় এবং সেটি প্লে করার মতো লিঙ্ক হয় তবে প্লে হবে
+                                if (isVideoUrl(url) && !url.contains("savefrom") && !url.contains("y2mate")) {
                                     onPlayVideo(url)
                                     return true
                                 }
+                                
+                                // অন্য সব ক্ষেত্রে ব্রাউজারে লোড হবে (ডাউনলোডারের জন্য জরুরি)
                                 return false
                             }
 
@@ -854,7 +1242,7 @@ fun WebViewScreen(
                             }
                         }
 
-                        setDownloadListener { downloadUrl, userAgent, contentDisposition, mimetype, contentLength ->
+                        setDownloadListener { downloadUrl, userAgent, contentDisposition, mimetype, _ ->
                             if (isVideoUrl(downloadUrl)) {
                                 onPlayVideo(downloadUrl)
                             } else {
@@ -923,9 +1311,13 @@ fun WebViewScreen(
                     trackColor = Color.Transparent
                 )
             }
+
         }
     }
+
 }
+
+
 
 @Composable
 fun DownloadStatusDialog(
@@ -1025,102 +1417,227 @@ fun openDownloadedFile(context: Context, downloadId: Long) {
             Toast.makeText(context, "No app found to open this file", Toast.LENGTH_SHORT).show()
         }
     }
+
 }
 
 fun isVideoUrl(url: String): Boolean {
     val lowUrl = url.lowercase()
-    return lowUrl.endsWith(".ts") || 
-           lowUrl.contains(".m3u8") || 
+    
+    // এপিকে বা অন্য ডাউনলোড ফাইল হলে ভিডিও হিসেবে প্লে করা যাবে না
+    if (lowUrl.contains(".apk") || lowUrl.contains(".zip") || lowUrl.contains(".rar") || 
+        lowUrl.contains(".pdf") || lowUrl.contains(".bin") || lowUrl.contains(".exe") ||
+        lowUrl.contains(".docx") || lowUrl.contains(".txt")) {
+        return false
+    }
+
+    return lowUrl.contains("m3u8") || 
+           lowUrl.contains(".ts") || 
+           lowUrl.contains(".m4s") ||
+           lowUrl.contains(".mp4") ||
+           lowUrl.contains(".mkv") ||
+           lowUrl.contains(".webm") ||
+           lowUrl.contains(".avi") ||
+           lowUrl.contains(".mov") ||
+           lowUrl.contains(".flv") ||
+           lowUrl.contains(".3gp") ||
            lowUrl.contains("/live/") || 
+           lowUrl.contains("stream") ||
+           lowUrl.contains("playlist") ||
+           lowUrl.contains("player") ||
+           lowUrl.contains("video") ||
+           lowUrl.contains("m3u") ||
+           lowUrl.contains("getstream") ||
+           lowUrl.contains(".r2.dev") || // Cloudflare R2 direct links
+           lowUrl.contains("drive.google") ||
            (lowUrl.contains(".js") && lowUrl.contains("as-cdn")) ||
-           lowUrl.contains("premiumtvs.space")
+           lowUrl.contains("premiumtvs.space") ||
+           lowUrl.contains("grandpearl.top") ||
+           lowUrl.contains(".mpd")
 }
 
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
-fun VideoPlayerScreen(url: String, onBack: () -> Unit) {
+fun VideoPlayerScreen(
+    url: String, 
+    isLandscape: Boolean,
+    onToggleRotation: () -> Unit,
+    onBack: () -> Unit
+) {
     val context = LocalContext.current
+    val activity = context as? Activity
+    
+    // State for playback position and duration
+    var currentPosition by remember { mutableLongStateOf(0L) }
+    var duration by remember { mutableLongStateOf(0L) }
+    var isPlaying by remember { mutableStateOf(true) }
+
     val exoPlayer = remember {
         val audioAttributes = AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
             .build()
 
-        // উন্নত বাফারিং কন্ট্রোল
+        // Optimized LoadControl for Fast Start and Low Buffering
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                30000, // Min buffer to start
-                60000, // Max buffer
-                2500,  // Buffer to start playback
-                5000   // Buffer after rebuffering
+                5000,  // Min buffer to start (Reduced for fast start)
+                30000, // Max buffer
+                1000,  // Buffer for playback
+                1500   // Buffer after re-buffer
             )
+            .setBackBuffer(0, false)
             .build()
+
+        val dataSourceFactory = DefaultHttpDataSource.Factory()
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(15000)
+            .setReadTimeoutMs(15000)
+            .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+            .setDefaultRequestProperties(mapOf(
+                "Referer" to "https://itsmuttakin.pages.dev/",
+                "Origin" to "https://itsmuttakin.pages.dev"
+            ))
 
         ExoPlayer.Builder(context)
             .setAudioAttributes(audioAttributes, true)
             .setLoadControl(loadControl)
-            .setWakeMode(C.WAKE_MODE_NETWORK)
+            .setMediaSourceFactory(androidx.media3.exoplayer.source.DefaultMediaSourceFactory(context).setDataSourceFactory(dataSourceFactory))
             .build().apply {
-            val isHls = url.contains(".m3u8") || url.contains(".js") || url.contains("as-cdn")
-            
-            val dataSourceFactory = DefaultHttpDataSource.Factory()
-                .setAllowCrossProtocolRedirects(true)
-                .setConnectTimeoutMs(15000) // টাইমআউট বাড়ানো হয়েছে
-                .setReadTimeoutMs(15000)
-                .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
-            
-            if (isHls) {
-                val mediaSource = androidx.media3.exoplayer.hls.HlsMediaSource.Factory(dataSourceFactory)
-                    .createMediaSource(MediaItem.fromUri(url))
-                setMediaSource(mediaSource)
-            } else {
-                setMediaItem(MediaItem.fromUri(url))
+                prepare()
+                playWhenReady = true
+                addListener(object : Player.Listener {
+                    override fun onPlaybackStateChanged(playbackState: Int) {
+                        if (playbackState == Player.STATE_READY) {
+                            duration = this@apply.duration
+                        }
+                    }
+                    override fun onIsPlayingChanged(isPlayingChange: Boolean) {
+                        isPlaying = isPlayingChange
+                    }
+                    override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                        // অটো রিট্রাই লজিক: যদি লিংক সাময়িকভাবে ড্রপ করে তবে আবার কানেক্ট করার চেষ্টা করবে
+                        val currentMediaItem = this@apply.currentMediaItem
+                        if (currentMediaItem != null) {
+                            this@apply.setMediaItem(currentMediaItem)
+                            this@apply.prepare()
+                            this@apply.play()
+                        }
+                    }
+                })
             }
-            
-            repeatMode = Player.REPEAT_MODE_ALL // এরর হলেও লুপ করার চেষ্টা করবে
-            prepare()
-            playWhenReady = true
+    }
+
+    // Update video source when URL changes (Fix for next channel click)
+    LaunchedEffect(url) {
+        exoPlayer.setMediaItem(MediaItem.fromUri(url))
+        exoPlayer.prepare()
+        exoPlayer.play()
+    }
+
+    // Update position periodically
+    LaunchedEffect(exoPlayer) {
+        while (true) {
+            currentPosition = exoPlayer.currentPosition
+            delay(1000)
         }
     }
 
-    // Full screen handling
-    val activity = context as? Activity
     DisposableEffect(Unit) {
-        val originalOrientation = activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-        
-        val window = activity?.window
-        val insetsController = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
-        insetsController?.apply {
-            hide(WindowInsetsCompat.Type.systemBars())
-            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        }
-
         onDispose {
             exoPlayer.release()
-            activity?.requestedOrientation = originalOrientation
-            insetsController?.show(WindowInsetsCompat.Type.systemBars())
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+    // Player Box with dynamic size
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(if (isLandscape) 400.dp else 230.dp) // Fixed height in portrait
+            .then(if (isLandscape) Modifier.fillMaxSize() else Modifier)
+            .background(Color.Black)
+    ) {
+        var showControls by remember { mutableStateOf(true) }
+        
+        LaunchedEffect(showControls, isPlaying) {
+            if (showControls && isPlaying) {
+                delay(5000)
+                showControls = false
+            }
+        }
+
         AndroidView(
             factory = {
                 PlayerView(it).apply {
                     player = exoPlayer
-                    useController = true
-                    keepScreenOn = true // এটি ভিডিও চলাকালীন স্ক্রিন বন্ধ হতে দেবে না
+                    useController = false
+                    keepScreenOn = true 
                 }
             },
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier.fillMaxSize().clickable { showControls = !showControls }
         )
         
-        IconButton(
-            onClick = onBack,
-            modifier = Modifier.padding(16.dp).align(Alignment.TopStart)
-        ) {
-            Icon(Icons.Default.Refresh, contentDescription = "Back", tint = Color.White)
+        if (showControls) {
+            Box(
+                modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.3f)),
+                contentAlignment = Alignment.Center
+            ) {
+                // Play/Pause Center
+                Surface(
+                    modifier = Modifier.size(60.dp).clip(CircleShape).clickable { if (isPlaying) exoPlayer.pause() else exoPlayer.play() },
+                    color = Color.White.copy(alpha = 0.8f),
+                    shape = CircleShape
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, null, tint = Color.Black, modifier = Modifier.size(36.dp))
+                    }
+                }
+
+                // Bottom Controls
+                Box(modifier = Modifier.fillMaxSize().padding(12.dp)) {
+                    // Seek bar (Small)
+                    if (duration > 0 && duration < 36000000) { 
+                        Slider(
+                            value = currentPosition.toFloat(),
+                            onValueChange = { exoPlayer.seekTo(it.toLong()) },
+                            valueRange = 0f..duration.toFloat().coerceAtLeast(1f),
+                            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 20.dp),
+                            colors = SliderDefaults.colors(thumbColor = Color.Cyan, activeTrackColor = Color.Cyan)
+                        )
+                    }
+
+                    // Rotate Button
+                    IconButton(
+                        onClick = onToggleRotation,
+                        modifier = Modifier.align(Alignment.BottomEnd).background(Color.Black.copy(alpha = 0.4f), CircleShape).size(36.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (isLandscape) Icons.Default.FullscreenExit else Icons.Default.Fullscreen,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    
+                    // Close Button
+                    IconButton(
+                        onClick = onBack,
+                        modifier = Modifier.align(Alignment.TopEnd).background(Color.Black.copy(alpha = 0.4f), CircleShape).size(36.dp)
+                    ) {
+                        Icon(Icons.Default.Close, null, tint = Color.White, modifier = Modifier.size(20.dp))
+                    }
+                }
+            }
         }
     }
+
+}
+
+fun formatTime(ms: Long): String {
+    val totalSeconds = (ms / 1000).coerceAtLeast(0)
+    val seconds = totalSeconds % 60
+    val minutes = (totalSeconds / 60) % 60
+    val hours = totalSeconds / 3600
+    return if (hours > 0) String.format(Locale.getDefault(), "%02d:%02d:%02d", hours, minutes, seconds)
+    else String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds)
 }

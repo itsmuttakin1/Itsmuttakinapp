@@ -2,9 +2,12 @@ package com.itsmuttakin.web
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.PictureInPictureParams
 import android.content.Context
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.provider.Settings
+import android.util.Rational
 import androidx.compose.ui.layout.ContentScale
 import java.net.HttpURLConnection
 import android.graphics.Bitmap
@@ -542,11 +545,38 @@ class MainActivity : ComponentActivity() {
 
     private fun timestampId(): Int = System.currentTimeMillis().toInt()
 
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (activePlayingVideoUrlState.value != null) {
+                try {
+                    val params = PictureInPictureParams.Builder()
+                        .setAspectRatio(Rational(16, 9))
+                        .build()
+                    enterPictureInPictureMode(params)
+                } catch (e: Exception) {}
+            }
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        isInPipModeState.value = isInPictureInPictureMode
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         wakeLock?.let {
             if (it.isHeld) it.release()
         }
+    }
+
+    companion object {
+        val activePlayingVideoUrlState = mutableStateOf<String?>(null)
+        val isInPipModeState = mutableStateOf(false)
     }
 }
 
@@ -627,6 +657,10 @@ fun AppNavigation(currentLang: String, refreshTrigger: Int, onLangChange: (Strin
     var playingVideoTitle by remember { mutableStateOf("") }
     var playingVideoIsVIP by remember { mutableStateOf(false) }
     var isPlayerLandscape by remember { mutableStateOf(false) }
+
+    LaunchedEffect(playingVideoUrl) {
+        MainActivity.activePlayingVideoUrlState.value = playingVideoUrl
+    }
 
     // Orientation handling for player
     LaunchedEffect(isPlayerLandscape) {
@@ -1386,6 +1420,20 @@ fun WebViewScreen(
                                     onClosePlayer()
                                 }
                             }
+
+                            @JavascriptInterface
+                            fun enterPip() {
+                                (context as? Activity)?.runOnUiThread {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                        try {
+                                            val params = PictureInPictureParams.Builder()
+                                                .setAspectRatio(Rational(16, 9))
+                                                .build()
+                                            (context as? Activity)?.enterPictureInPictureMode(params)
+                                        } catch (e: Exception) {}
+                                    }
+                                }
+                            }
                         }, "Android")
 
                         webViewClient = object : WebViewClient() {
@@ -1776,8 +1824,11 @@ fun VideoPlayerScreen(
     
     // Quality Selection States
     var showQualityDialog by remember { mutableStateOf(false) }
+    var showSpeedDialog by remember { mutableStateOf(false) }
+    var selectedSpeed by remember { mutableFloatStateOf(1.0f) }
     val qualityOptions = remember { mutableStateListOf<VideoQuality>() }
     var selectedQualityName by remember { mutableStateOf("Auto") }
+    val isInPip = MainActivity.isInPipModeState.value
 
     val exoPlayer = remember {
         val audioAttributes = AudioAttributes.Builder()
@@ -1926,27 +1977,61 @@ fun VideoPlayerScreen(
             modifier = Modifier.fillMaxSize().clickable { showControls = !showControls }
         )
 
-        // Persistent Classic Amber-Gold Watermark Badge in Native Player
-        GoldWatermarkBadge(
-            text = if (title.contains("Live", ignoreCase = true) || title.contains("TV", ignoreCase = true)) "M BOX TV" else "M BOX CINEMA",
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(12.dp)
-        )
+        // Persistent Classic Amber-Gold Watermark Badge in Native Player (Hidden in PiP)
+        if (!isInPip) {
+            GoldWatermarkBadge(
+                text = if (title.contains("Live", ignoreCase = true) || title.contains("TV", ignoreCase = true)) "M BOX TV" else "M BOX CINEMA",
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(12.dp)
+            )
+        }
         
-        if (showControls) {
+        if (showControls && !isInPip) {
             Box(
-                modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.3f)),
+                modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)),
                 contentAlignment = Alignment.Center
             ) {
-                // Play/Pause Center
-                Surface(
-                    modifier = Modifier.size(60.dp).clip(CircleShape).clickable { if (isPlaying) exoPlayer.pause() else exoPlayer.play() },
-                    color = Color.White.copy(alpha = 0.8f),
-                    shape = CircleShape
+                // Center Play/Pause and 10s Seek Controls
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(24.dp)
                 ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, null, tint = Color.Black, modifier = Modifier.size(36.dp))
+                    // Rewind 10s
+                    Surface(
+                        modifier = Modifier.size(44.dp).clip(CircleShape).clickable {
+                            exoPlayer.seekTo((exoPlayer.currentPosition - 10000L).coerceAtLeast(0L))
+                        },
+                        color = Color.Black.copy(alpha = 0.5f),
+                        shape = CircleShape
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text("-10s", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    // Play/Pause Center
+                    Surface(
+                        modifier = Modifier.size(56.dp).clip(CircleShape).clickable { if (isPlaying) exoPlayer.pause() else exoPlayer.play() },
+                        color = Color.White.copy(alpha = 0.85f),
+                        shape = CircleShape
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, null, tint = Color.Black, modifier = Modifier.size(34.dp))
+                        }
+                    }
+
+                    // Forward 10s
+                    Surface(
+                        modifier = Modifier.size(44.dp).clip(CircleShape).clickable {
+                            exoPlayer.seekTo((exoPlayer.currentPosition + 10000L).coerceAtMost(duration))
+                        },
+                        color = Color.Black.copy(alpha = 0.5f),
+                        shape = CircleShape
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text("+10s", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
 
@@ -1963,10 +2048,10 @@ fun VideoPlayerScreen(
                         )
                     }
 
-                    // Quality Info (Current Resolution)
+                    // Quality & Speed Info
                     Text(
-                        text = "Quality: $selectedQualityName",
-                        color = Color.White.copy(alpha = 0.7f),
+                        text = "Quality: $selectedQualityName  •  Speed: ${selectedSpeed}x",
+                        color = Color.White.copy(alpha = 0.8f),
                         fontSize = 11.sp,
                         modifier = Modifier.align(Alignment.BottomStart).padding(bottom = 4.dp)
                     )
@@ -1976,12 +2061,37 @@ fun VideoPlayerScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        // Playback Speed Button
+                        IconButton(
+                            onClick = { showSpeedDialog = true },
+                            modifier = Modifier.background(Color.Black.copy(alpha = 0.4f), CircleShape).size(36.dp)
+                        ) {
+                            Text("${selectedSpeed}x", color = Color.Cyan, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+
                         // Quality Settings Button
                         IconButton(
                             onClick = { showQualityDialog = true },
                             modifier = Modifier.background(Color.Black.copy(alpha = 0.4f), CircleShape).size(36.dp)
                         ) {
                             Icon(Icons.Default.Settings, "Quality", tint = Color.White, modifier = Modifier.size(20.dp))
+                        }
+
+                        // Picture-in-Picture Button
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            IconButton(
+                                onClick = {
+                                    try {
+                                        val params = PictureInPictureParams.Builder()
+                                            .setAspectRatio(Rational(16, 9))
+                                            .build()
+                                        (context as? Activity)?.enterPictureInPictureMode(params)
+                                    } catch (e: Exception) {}
+                                },
+                                modifier = Modifier.background(Color.Black.copy(alpha = 0.4f), CircleShape).size(36.dp)
+                            ) {
+                                Text("PiP", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
                         }
 
                         // Rotate Button
@@ -2008,6 +2118,48 @@ fun VideoPlayerScreen(
                 }
             }
         }
+    }
+
+    // Playback Speed Selection Dialog
+    if (showSpeedDialog) {
+        val speedOptions = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+        AlertDialog(
+            onDismissRequest = { showSpeedDialog = false },
+            title = { Text("Select Playback Speed", color = Color.Cyan, fontWeight = FontWeight.Bold) },
+            text = {
+                LazyColumn {
+                    items(speedOptions) { spd ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    selectedSpeed = spd
+                                    exoPlayer.setPlaybackSpeed(spd)
+                                    showSpeedDialog = false
+                                }
+                                .padding(vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = selectedSpeed == spd,
+                                onClick = null,
+                                colors = RadioButtonDefaults.colors(selectedColor = Color.Cyan)
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Text(if (spd == 1.0f) "1.0x (Normal)" else "${spd}x", color = Color.White, fontSize = 16.sp)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showSpeedDialog = false }) {
+                    Text("Cancel", color = Color.Cyan)
+                }
+            },
+            containerColor = Color(0xFF0F2027),
+            shape = RoundedCornerShape(28.dp)
+        )
+    }
     }
 
     // Quality Selection Dialog
